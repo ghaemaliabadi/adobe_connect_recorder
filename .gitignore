@@ -1,0 +1,9 @@
+*.exe
+adobeconnectrecorder_*
+
+recordings/
+*.mp4
+*.webm
+
+*.log
+debug_screenshot.png
