@@ -1,5 +1,7 @@
 *.exe
 adobeconnectrecorder_*
+webserver_*
+webserver_state.json
 
 recordings/
 *.mp4

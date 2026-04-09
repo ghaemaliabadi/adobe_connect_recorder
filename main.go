@@ -17,18 +17,253 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	_ "time/tzdata" // embed IANA timezone DB so Asia/Tehran works on minimal Linux installs
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 )
 
+func init() {
+	loc, err := time.LoadLocation("Asia/Tehran")
+	if err != nil {
+		loc = time.FixedZone("IRST", 3*3600+30*60)
+	}
+	time.Local = loc
+}
 
 func main() {
 	if err := run(); err != nil {
 		log.Printf("fatal error: %v", err)
 		os.Exit(1)
 	}
+}
+
+// sessionOpts carries all parameters for a single browser recording attempt.
+type sessionOpts struct {
+	url             string
+	outDir          string
+	loadWait        int
+	playTimeout     int
+	ffmpegPath      string
+	displayWidth    int
+	displayHeight   int
+	debugScreenshot bool
+	testMode        bool
+	activeDisplay   string
+	audioSource     string
+	browserPath     string
+}
+
+// isRetryableError reports whether err is a transient failure that warrants
+// re-launching Chrome and trying the recording again.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, tag := range []string{
+		"net::ERR_",
+		"ERR_NAME_NOT_RESOLVED",
+		"ERR_CONNECTION",
+		"ERR_TIMED_OUT",
+		"navigation failed",
+		"page did not load",
+		"start ffmpeg recorder failed",
+	} {
+		if strings.Contains(s, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordSession launches Chrome, navigates to the URL, records, and saves the file.
+// It is designed to be called inside a retry loop.
+func recordSession(ctx context.Context, opts sessionOpts) error {
+	l := launcher.New().
+		Bin(opts.browserPath).
+		Headless(false).
+		Leakless(false).
+		NoSandbox(true).
+		Set("autoplay-policy", "no-user-gesture-required").
+		Set("disable-dev-shm-usage").
+		Set("no-first-run").
+		Set("disable-default-apps").
+		Set("disable-extensions")
+
+	if runtime.GOOS == "linux" {
+		l = l.
+			Set("kiosk").
+			Set("disable-gpu").
+			Set("window-size", fmt.Sprintf("%d,%d", opts.displayWidth, opts.displayHeight))
+	} else {
+		l = l.Set("start-maximized")
+	}
+
+	u, err := l.Launch()
+	if err != nil {
+		return fmt.Errorf("launch chrome: %w", err)
+	}
+	log.Printf("Chrome launched.")
+
+	browser := rod.New().ControlURL(u).Context(ctx).MustConnect()
+	defer browser.MustClose()
+	log.Printf("Connected to Chrome DevTools.")
+
+	log.Printf("Opening new browser tab...")
+	page, pageErr := browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
+	if pageErr != nil {
+		return fmt.Errorf("open blank page: %w", pageErr)
+	}
+	log.Printf("Tab opened. Navigating to URL...")
+
+	// WaitNavigation must be registered BEFORE calling Navigate.
+	waitDOMReady := page.WaitNavigation(proto.PageLifecycleEventNameDOMContentLoaded)
+
+	navErr := page.Navigate(opts.url)
+	if navErr != nil {
+		// Network-level failures are retryable (DNS, connection refused, timeout…).
+		// Treat them as hard errors so the caller can retry with a fresh Chrome.
+		if isRetryableError(navErr) {
+			return fmt.Errorf("navigation failed (retryable): %w", navErr)
+		}
+		log.Printf("warning: navigate returned non-fatal error (%v), continuing...", navErr)
+	}
+	log.Printf("Navigate call returned. Waiting for DOMContentLoaded...")
+
+	domDone := make(chan struct{}, 1)
+	go func() { waitDOMReady(); domDone <- struct{}{} }()
+	select {
+	case <-domDone:
+		log.Printf("DOMContentLoaded fired.")
+	case <-time.After(90 * time.Second):
+		log.Printf("warning: DOMContentLoaded not fired within 90s, continuing anyway...")
+	}
+
+	// Validate that the page actually loaded (not a Chrome error page).
+	if info, infoErr := page.Info(); infoErr == nil {
+		pageURL := info.URL
+		if !strings.HasPrefix(pageURL, "http://") && !strings.HasPrefix(pageURL, "https://") {
+			return fmt.Errorf("page did not load (current URL: %s)", pageURL)
+		}
+		log.Printf("Page loaded: %s", pageURL)
+	}
+
+	if opts.debugScreenshot {
+		if img, ssErr := page.Screenshot(false, nil); ssErr != nil {
+			log.Printf("debug screenshot failed: %v", ssErr)
+		} else {
+			ssPath := filepath.Join(".", "debug_screenshot.png")
+			if writeErr := os.WriteFile(ssPath, img, 0o644); writeErr != nil {
+				log.Printf("debug screenshot write failed: %v", writeErr)
+			} else {
+				log.Printf("Debug screenshot saved: %s", ssPath)
+			}
+		}
+	}
+
+	wait := time.Duration(opts.loadWait) * time.Second
+	log.Printf("Initial wait %s for page stabilization...", wait)
+	time.Sleep(wait)
+
+	if err := waitAndClickPlay(page, time.Duration(opts.playTimeout)*time.Second); err != nil {
+		log.Printf("warning: play button click skipped/failed: %v", err)
+	} else {
+		log.Println("Clicked play button when it became visible.")
+	}
+	if err := ensureMediaPlayback(page); err != nil {
+		log.Printf("warning: media playback handshake failed: %v", err)
+	}
+
+	if n, err := dismissNotifications(page); err != nil {
+		log.Printf("warning: dismiss notifications: %v", err)
+	} else if n > 0 {
+		log.Printf("Dismissed %d notification(s).", n)
+	}
+
+	absOutDir, err := filepath.Abs(opts.outDir)
+	if err != nil {
+		return fmt.Errorf("cannot resolve output directory: %w", err)
+	}
+	if err := os.MkdirAll(absOutDir, 0o755); err != nil {
+		return fmt.Errorf("cannot create output directory: %w", err)
+	}
+
+	var region *captureRegion
+	if runtime.GOOS == "linux" {
+		time.Sleep(2 * time.Second)
+		cr, crErr := getContentBounds(page, opts.displayWidth, opts.displayHeight)
+		if crErr != nil {
+			log.Printf("warning: content bounds detection failed (%v); capturing full display %dx%d",
+				crErr, opts.displayWidth, opts.displayHeight)
+		} else {
+			region = cr
+			log.Printf("Content region detected: x=%d y=%d w=%d h=%d", cr.X, cr.Y, cr.W, cr.H)
+		}
+	} else {
+		region, err = getChromeWindowBounds(browser, page)
+		if err != nil {
+			log.Printf("warning: could not get Chrome window bounds, recording full desktop: %v", err)
+		} else {
+			log.Printf("Chrome window region (clamped): x=%d y=%d w=%d h=%d",
+				region.X, region.Y, region.W, region.H)
+		}
+	}
+
+	tempOut := filepath.Join(absOutDir, fmt.Sprintf("_tmp_record_%d.mkv", time.Now().Unix()))
+	ffrec, err := startFFmpegDesktopRecorder(opts.ffmpegPath, tempOut, region, opts.activeDisplay, opts.audioSource)
+	if err != nil {
+		_ = os.Remove(tempOut)
+		return fmt.Errorf("start ffmpeg recorder failed: %w", err)
+	}
+	defer func() { _ = ffrec.Stop(15 * time.Second) }()
+
+	log.Println("Recording started.")
+	testSeconds := 0
+	if opts.testMode {
+		testSeconds = 15
+		log.Printf("Test mode: will stop after 15 seconds.")
+	}
+	if err := waitUntilDone(page, testSeconds); err != nil {
+		log.Printf("wait loop warning: %v", err)
+	}
+
+	stopErr := ffrec.Stop(3 * time.Minute)
+	if stopErr != nil {
+		log.Printf("warning: ffmpeg stop returned error: %v", stopErr)
+	}
+	if !fileExists(tempOut) {
+		return fmt.Errorf("ffmpeg did not create output file: %s", tempOut)
+	}
+
+	title := urlPathFilename(opts.url)
+	if title == "" {
+		title = safeFilename(page.MustInfo().Title)
+	}
+	if title == "" {
+		title = "recording"
+	}
+
+	outPath := filepath.Join(absOutDir, title+".mp4")
+	if remuxErr := remuxToMP4(opts.ffmpegPath, tempOut, outPath); remuxErr != nil {
+		log.Printf("warning: remux MKV→MP4 failed (%v); saving as MKV instead", remuxErr)
+		mkvOut := filepath.Join(absOutDir, title+".mkv")
+		if renErr := os.Rename(tempOut, mkvOut); renErr != nil {
+			return fmt.Errorf("could not save recording: remux failed (%v), rename failed (%v)", remuxErr, renErr)
+		}
+		log.Printf("Saved: %s", mkvOut)
+		if stopErr != nil {
+			return fmt.Errorf("stop ffmpeg recorder failed: %w", stopErr)
+		}
+		return nil
+	}
+	_ = os.Remove(tempOut)
+	log.Printf("Saved: %s", outPath)
+	if stopErr != nil {
+		return fmt.Errorf("stop ffmpeg recorder failed: %w", stopErr)
+	}
+	return nil
 }
 
 func run() error {
@@ -60,7 +295,8 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// On Linux: ensure a virtual X display and PulseAudio sink are available.
+	// Xvfb and PulseAudio are set up ONCE outside the retry loop so each retry
+	// reuses the same virtual display and audio sink rather than spawning new ones.
 	activeDisplay := *displayFlag
 	audioSource := ""
 	if runtime.GOOS == "linux" {
@@ -80,7 +316,6 @@ func run() error {
 		} else {
 			audioSource = mon
 			log.Printf("PulseAudio monitor source: %s", audioSource)
-			// Tell Chrome to output audio to our virtual sink.
 			_ = os.Setenv("PULSE_SINK", "chrome_rec")
 		}
 	}
@@ -91,174 +326,59 @@ func run() error {
 	}
 	log.Printf("Using browser binary: %s", browserPath)
 
-	l := launcher.New().
-		Bin(browserPath).
-		Headless(false).
-		Leakless(false).
-		NoSandbox(true).
-		Set("autoplay-policy", "no-user-gesture-required").
-		Set("disable-dev-shm-usage").
-		Set("no-first-run").
-		Set("disable-default-apps").
-		Set("disable-extensions")
-
-	if runtime.GOOS == "linux" {
-		// Kiosk mode on Linux: removes address bar, fills the entire virtual display.
-		// Also disable GPU since headless servers typically have no GPU.
-		l = l.
-			Set("kiosk").
-			Set("disable-gpu").
-			Set("window-size", fmt.Sprintf("%d,%d", *displayWidthFlag, *displayHeightFlag))
-	} else {
-		l = l.Set("start-maximized")
+	opts := sessionOpts{
+		url:             url,
+		outDir:          *outDirFlag,
+		loadWait:        *loadWaitFlag,
+		playTimeout:     *playTimeoutFlag,
+		ffmpegPath:      *ffmpegPathFlag,
+		displayWidth:    *displayWidthFlag,
+		displayHeight:   *displayHeightFlag,
+		debugScreenshot: *debugScreenshotFlag,
+		testMode:        *testFlag,
+		activeDisplay:   activeDisplay,
+		audioSource:     audioSource,
+		browserPath:     browserPath,
 	}
 
-	u, err := l.Launch()
-	if err != nil {
-		return fmt.Errorf("launch chrome: %w", err)
-	}
-	log.Printf("Chrome launched.")
-
-	browser := rod.New().ControlURL(u).Context(ctx).MustConnect()
-	defer browser.MustClose()
-	log.Printf("Connected to Chrome DevTools.")
-
-	log.Printf("Opening new browser tab...")
-	page, pageErr := browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
-	if pageErr != nil {
-		return fmt.Errorf("open blank page: %w", pageErr)
-	}
-	log.Printf("Tab opened. Setting up navigation listener...")
-
-	// WaitNavigation must be registered BEFORE calling Navigate.
-	waitDOMReady := page.WaitNavigation(proto.PageLifecycleEventNameDOMContentLoaded)
-
-	log.Printf("Navigating to URL...")
-	if navErr := page.Navigate(url); navErr != nil {
-		log.Printf("warning: navigate returned error (%v), continuing...", navErr)
-	}
-	log.Printf("Navigate call returned. Waiting for DOMContentLoaded...")
-
-	// Wait for DOM with a 90-second cap; always continue even if it times out.
-	domDone := make(chan struct{}, 1)
-	go func() {
-		waitDOMReady()
-		domDone <- struct{}{}
-	}()
-	select {
-	case <-domDone:
-		log.Printf("DOMContentLoaded fired.")
-	case <-time.After(90 * time.Second):
-		log.Printf("warning: DOMContentLoaded not fired within 90s, continuing anyway...")
-	}
-	log.Printf("Page DOM step done.")
-
-	// Save a debug screenshot so we can see what Chrome is rendering on the server.
-	if *debugScreenshotFlag {
-		if img, ssErr := page.Screenshot(false, nil); ssErr != nil {
-			log.Printf("debug screenshot failed: %v", ssErr)
-		} else {
-			ssPath := filepath.Join(".", "debug_screenshot.png")
-			if writeErr := os.WriteFile(ssPath, img, 0o644); writeErr != nil {
-				log.Printf("debug screenshot write failed: %v", writeErr)
-			} else {
-				log.Printf("Debug screenshot saved: %s", ssPath)
-			}
+	// Retry loop: up to 3 retries (4 total attempts) for transient failures.
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			delay := time.Duration(attempt-1) * 10 * time.Second
+			log.Printf("=== Retry %d/%d — waiting %v before next attempt ===",
+				attempt-1, maxAttempts-1, delay)
+			time.Sleep(delay)
+		}
+		lastErr = recordSession(ctx, opts)
+		if lastErr == nil {
+			return nil
+		}
+		log.Printf("Attempt %d/%d failed: %v", attempt, maxAttempts, lastErr)
+		if !isRetryableError(lastErr) {
+			log.Printf("Error is not retryable; giving up.")
+			return lastErr
 		}
 	}
+	return fmt.Errorf("all %d attempts failed; last error: %w", maxAttempts, lastErr)
+}
 
-	wait := time.Duration(*loadWaitFlag) * time.Second
-	log.Printf("Initial wait %s for page stabilization...", wait)
-	time.Sleep(wait)
-
-	if err := waitAndClickPlay(page, time.Duration(*playTimeoutFlag)*time.Second); err != nil {
-		log.Printf("warning: play button click skipped/failed: %v", err)
-	} else {
-		log.Println("Clicked play button when it became visible.")
+// remuxToMP4 rewraps src (MKV) into dst (MP4) by copying streams without
+// re-encoding. The moov atom is placed at the start for fast web streaming.
+func remuxToMP4(ffmpegPath, src, dst string) error {
+	if ffmpegPath == "" {
+		ffmpegPath = "ffmpeg"
 	}
-	if err := ensureMediaPlayback(page); err != nil {
-		log.Printf("warning: media playback handshake failed: %v", err)
-	}
-
-	// Dismiss any "Switch to Classic View" or other dismissible notifications.
-	if n, err := dismissNotifications(page); err != nil {
-		log.Printf("warning: dismiss notifications: %v", err)
-	} else if n > 0 {
-		log.Printf("Dismissed %d notification(s).", n)
-	}
-
-	absOutDir, err := filepath.Abs(*outDirFlag)
+	cmd := exec.Command(ffmpegPath, "-y", "-i", src,
+		"-c", "copy",
+		"-movflags", "+faststart",
+		dst,
+	)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("cannot resolve output directory: %w", err)
+		return fmt.Errorf("exit status: %w\n%s", err, string(out))
 	}
-	if err := os.MkdirAll(absOutDir, 0o755); err != nil {
-		return fmt.Errorf("cannot create output directory: %w", err)
-	}
-
-	// Detect the exact content region to avoid capturing whitespace around the player.
-	var region *captureRegion
-	if runtime.GOOS == "linux" {
-		// Short wait so the player finishes laying out after the play click.
-		time.Sleep(2 * time.Second)
-		cr, crErr := getContentBounds(page, *displayWidthFlag, *displayHeightFlag)
-		if crErr != nil {
-			log.Printf("warning: content bounds detection failed (%v); capturing full display %dx%d",
-				crErr, *displayWidthFlag, *displayHeightFlag)
-		} else {
-			region = cr
-			log.Printf("Content region detected: x=%d y=%d w=%d h=%d", cr.X, cr.Y, cr.W, cr.H)
-		}
-	} else {
-		region, err = getChromeWindowBounds(browser, page)
-		if err != nil {
-			log.Printf("warning: could not get Chrome window bounds, recording full desktop: %v", err)
-		} else {
-			log.Printf("Chrome window region (clamped): x=%d y=%d w=%d h=%d",
-				region.X, region.Y, region.W, region.H)
-		}
-	}
-
-	tempOut := filepath.Join(absOutDir, fmt.Sprintf("_tmp_record_%d.mp4", time.Now().Unix()))
-	ffrec, err := startFFmpegDesktopRecorder(*ffmpegPathFlag, tempOut, region, activeDisplay, audioSource)
-	if err != nil {
-		return fmt.Errorf("start ffmpeg recorder failed: %w", err)
-	}
-	defer func() {
-		_ = ffrec.Stop(2 * time.Second)
-	}()
-
-	log.Println("Recording started.")
-	testSeconds := 0
-	if *testFlag {
-		testSeconds = 15
-		log.Printf("Test mode: will stop after 15 seconds.")
-	}
-	if err := waitUntilDone(page, testSeconds); err != nil {
-		log.Printf("wait loop warning: %v", err)
-	}
-
-	if err := ffrec.Stop(20 * time.Second); err != nil {
-		return fmt.Errorf("stop ffmpeg recorder failed: %w", err)
-	}
-	if !fileExists(tempOut) {
-		return fmt.Errorf("ffmpeg did not create output file: %s", tempOut)
-	}
-
-	// Use URL path segment as primary filename (e.g. "pv0k1icomhs3" from the URL).
-	// Fall back to page title, then "recording".
-	title := urlPathFilename(url)
-	if title == "" {
-		title = safeFilename(page.MustInfo().Title)
-	}
-	if title == "" {
-		title = "recording"
-	}
-	outPath := filepath.Join(absOutDir, title+".mp4")
-	if err := os.Rename(tempOut, outPath); err != nil {
-		return fmt.Errorf("finalize output file: %w", err)
-	}
-
-	log.Printf("Saved: %s", outPath)
 	return nil
 }
 
@@ -625,7 +745,9 @@ func startFFmpegDesktopRecorder(ffmpegPath, outPath string, region *captureRegio
 	if hasAudio {
 		args = append(args, "-c:a", "aac", "-b:a", "128k")
 	}
-	args = append(args, "-movflags", "+faststart", outPath)
+	// No -movflags here: we record to MKV which writes incrementally and
+	// needs no finalization. The moov-to-front step happens in remuxToMP4.
+	args = append(args, outPath)
 
 	cmd := exec.Command(ffmpegPath, args...)
 
@@ -650,6 +772,10 @@ func startFFmpegDesktopRecorder(ffmpegPath, outPath string, region *captureRegio
 	go func() {
 		sc := bufio.NewScanner(stderrPipe)
 		sc.Buffer(make([]byte, 256*1024), 256*1024)
+		// FFmpeg writes status updates with \r (not \n) so each update would
+		// otherwise accumulate into one enormous "line" until the next real \n.
+		// Treating \r as a line terminator keeps each update as a short line.
+		sc.Split(scanCROrLF)
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
 			if line != "" {
@@ -766,6 +892,30 @@ func resolveBrowserPath(userPath string) (string, error) {
 		}
 	}
 	return "", errors.New("cannot find Chrome/Edge locally. Install Chrome/Edge or pass -browser-path \"C:\\\\path\\\\to\\\\chrome.exe\"")
+}
+
+// scanCROrLF is a bufio.SplitFunc that treats \r, \n, and \r\n all as line
+// terminators. FFmpeg writes its progress updates using bare \r (overwriting
+// the same terminal line), so the default ScanLines (\n only) would accumulate
+// thousands of status updates into one huge "line" before the next real \n.
+func scanCROrLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	for i, b := range data {
+		if b == '\r' || b == '\n' {
+			j := i + 1
+			// Consume a paired \r\n or \n\r as a single line ending.
+			if j < len(data) && (data[j] == '\r' || data[j] == '\n') && data[j] != b {
+				j++
+			}
+			return j, data[:i], nil
+		}
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 func fileExists(path string) bool {
