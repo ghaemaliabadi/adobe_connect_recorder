@@ -309,7 +309,10 @@ func run() error {
 	activeDisplay := *displayFlag
 	audioSource := ""
 	if runtime.GOOS == "linux" {
-		disp, dispErr := ensureDisplay(activeDisplay, *displayWidthFlag, *displayHeightFlag)
+		// Each recorder process must own a private Xvfb display so that
+		// concurrent recordings never share a virtual screen. We never inherit
+		// $DISPLAY from the parent environment for the same reason.
+		disp, xvfbCmd, dispErr := ensureDisplay(activeDisplay, *displayWidthFlag, *displayHeightFlag)
 		if dispErr != nil {
 			return fmt.Errorf("ensure X display: %w", dispErr)
 		}
@@ -317,6 +320,15 @@ func run() error {
 		log.Printf("Using X display: %s", activeDisplay)
 		if setErr := os.Setenv("DISPLAY", activeDisplay); setErr != nil {
 			return fmt.Errorf("setenv DISPLAY: %w", setErr)
+		}
+		if xvfbCmd != nil {
+			defer func() {
+				if xvfbCmd.Process != nil {
+					log.Printf("Stopping Xvfb on %s (PID %d)", activeDisplay, xvfbCmd.Process.Pid)
+					_ = xvfbCmd.Process.Kill()
+					_ = xvfbCmd.Wait()
+				}
+			}()
 		}
 
 		// Unique sink name per process so concurrent recorders don't mix audio.
@@ -452,21 +464,40 @@ func teardownLinuxAudio(moduleID string) {
 	}
 }
 
-// ensureDisplay makes sure a valid DISPLAY is available on Linux.
-// If displayID is non-empty, it is used as-is.
-// Otherwise a new Xvfb instance is started on :99 (or :100, :101 … until one succeeds).
-func ensureDisplay(displayID string, width, height int) (string, error) {
-	if displayID == "" {
-		displayID = os.Getenv("DISPLAY")
-	}
+// ensureDisplay starts a private Xvfb instance for this recorder process and
+// returns the display string (e.g. ":105") and the running Xvfb *exec.Cmd so
+// the caller can defer-kill it.
+//
+// If displayID is non-empty (i.e. the -display flag was set explicitly), that
+// display is used as-is and no new Xvfb is started (xvfbCmd == nil).
+//
+// IMPORTANT: we intentionally do NOT fall back to $DISPLAY from the environment.
+// When multiple recorder processes run concurrently they each inherit the same
+// $DISPLAY from the webserver parent, which would cause all Chrome instances to
+// render to the same virtual screen and FFmpeg to capture the wrong content.
+func ensureDisplay(displayID string, width, height int) (disp string, xvfbCmd *exec.Cmd, err error) {
 	if displayID != "" {
-		log.Printf("Re-using existing X display: %s", displayID)
-		return displayID, nil
+		log.Printf("Using explicitly requested X display: %s", displayID)
+		return displayID, nil, nil
 	}
 
-	// Try to start Xvfb on :99, :100, …
-	for num := 99; num < 110; num++ {
-		disp := fmt.Sprintf(":%d", num)
+	// Derive a per-process starting display number from the PID so that
+	// sibling recorder processes are unlikely to race on the same number.
+	pid := os.Getpid()
+	base := 100 + (pid % 900) // range :100–:999
+
+	for offset := 0; offset < 200; offset++ {
+		num := ((base - 100 + offset) % 900) + 100
+		disp = fmt.Sprintf(":%d", num)
+
+		// Skip if another Xvfb already owns this display number.
+		if _, statErr := os.Stat(fmt.Sprintf("/tmp/.X%d-lock", num)); statErr == nil {
+			continue
+		}
+		if _, statErr := os.Stat(fmt.Sprintf("/tmp/.X11-unix/X%d", num)); statErr == nil {
+			continue
+		}
+
 		cmd := exec.Command("Xvfb", disp,
 			"-screen", "0", fmt.Sprintf("%dx%dx24", width, height),
 			"-ac",
@@ -474,28 +505,19 @@ func ensureDisplay(displayID string, width, height int) (string, error) {
 			"+render",
 			"-noreset",
 		)
-		if err := cmd.Start(); err != nil {
-			return "", fmt.Errorf("cannot start Xvfb (is it installed?): %w", err)
+		if startErr := cmd.Start(); startErr != nil {
+			return "", nil, fmt.Errorf("cannot start Xvfb (is it installed?): %w", startErr)
 		}
-		// Give Xvfb ~1 s to initialize and detect if it exited immediately.
+		// Give Xvfb ~1 s to initialise and detect an immediate exit.
 		time.Sleep(1 * time.Second)
 		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 			log.Printf("Xvfb on %s exited immediately, trying next display number", disp)
 			continue
 		}
-		log.Printf("Xvfb started on %s (%dx%d)", disp, width, height)
-		// Register cleanup so Xvfb is killed when the recorder exits.
-		go func(p *os.Process) {
-			// Wait until our process exits, then kill Xvfb.
-			// We rely on defer in run() calling cancel(); the goroutine below
-			// simply ensures Xvfb does not outlive us.
-			_ = p // kept alive by process group; explicit kill via defer in run() not needed here
-		}(cmd.Process)
-		// Store process for deferred kill (handled via os.Exit path via log.Fatal).
-		runtime.SetFinalizer(cmd.Process, func(p *os.Process) { _ = p.Kill() })
-		return disp, nil
+		log.Printf("Xvfb started on %s (PID %d, %dx%d)", disp, cmd.Process.Pid, width, height)
+		return disp, cmd, nil
 	}
-	return "", errors.New("could not start Xvfb on any display number :99–:109")
+	return "", nil, errors.New("could not start Xvfb on any available display number (:100–:999)")
 }
 
 type captureRegion struct {
