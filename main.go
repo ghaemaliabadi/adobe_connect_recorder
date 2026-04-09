@@ -167,6 +167,15 @@ func recordSession(ctx context.Context, opts sessionOpts) error {
 	log.Printf("Initial wait %s for page stabilization...", wait)
 	time.Sleep(wait)
 
+	// Detect expired session: Adobe Connect redirects to a login page when the
+	// session token is invalid or the link has expired.
+	if expired, checkErr := isLoginPageVisible(page); checkErr != nil {
+		log.Printf("warning: session expiry check failed: %v", checkErr)
+	} else if expired {
+		log.Printf("[SESSION_EXPIRED] صفحه لاگین Adobe Connect نمایش داده شد — لینک یا سشن منقضی شده است. لطفاً لینک جدیدی از Adobe Connect دریافت کنید.")
+		return fmt.Errorf("session expired: login page detected — please get a fresh session URL")
+	}
+
 	if err := waitAndClickPlay(page, time.Duration(opts.playTimeout)*time.Second); err != nil {
 		log.Printf("warning: play button click skipped/failed: %v", err)
 	} else {
@@ -310,13 +319,16 @@ func run() error {
 			return fmt.Errorf("setenv DISPLAY: %w", setErr)
 		}
 
-		mon, audioErr := setupLinuxAudio()
+		// Unique sink name per process so concurrent recorders don't mix audio.
+		sinkName := fmt.Sprintf("chrome_rec_%d", os.Getpid())
+		mon, moduleID, audioErr := setupLinuxAudio(sinkName)
 		if audioErr != nil {
 			log.Printf("warning: audio setup failed (%v); recording will have no sound", audioErr)
 		} else {
 			audioSource = mon
 			log.Printf("PulseAudio monitor source: %s", audioSource)
-			_ = os.Setenv("PULSE_SINK", "chrome_rec")
+			_ = os.Setenv("PULSE_SINK", sinkName)
+			defer teardownLinuxAudio(moduleID)
 		}
 	}
 
@@ -390,16 +402,17 @@ type ffmpegRecorder struct {
 	stderrBuf *strings.Builder
 }
 
-// setupLinuxAudio starts PulseAudio (if needed), creates a virtual null sink
-// so Chrome has somewhere to send audio, and returns the monitor source name
-// that ffmpeg should capture from.
-// Returns ("", nil) when PulseAudio is unavailable so callers can skip audio.
-func setupLinuxAudio() (monitorSource string, err error) {
+// setupLinuxAudio starts PulseAudio (if needed) and creates a dedicated null
+// sink whose name is unique to this process (chrome_rec_<PID>). This prevents
+// audio from multiple concurrent recorder processes from mixing together.
+// Returns (monitorSource, moduleID, error). moduleID should be passed to
+// teardownLinuxAudio when the recording is done.
+func setupLinuxAudio(sinkName string) (monitorSource, moduleID string, err error) {
 	if _, lookErr := exec.LookPath("pulseaudio"); lookErr != nil {
-		return "", fmt.Errorf("pulseaudio not found in PATH (install with: apt-get install -y pulseaudio)")
+		return "", "", fmt.Errorf("pulseaudio not found in PATH (install with: apt-get install -y pulseaudio)")
 	}
 	if _, lookErr := exec.LookPath("pactl"); lookErr != nil {
-		return "", fmt.Errorf("pactl not found in PATH")
+		return "", "", fmt.Errorf("pactl not found in PATH")
 	}
 
 	// Start pulseaudio daemon (idempotent: safe to run when already running).
@@ -414,19 +427,29 @@ func setupLinuxAudio() (monitorSource string, err error) {
 	}
 	time.Sleep(800 * time.Millisecond)
 
-	// Create a dedicated null sink for Chrome's audio output.
-	// pactl returns the module-id on stdout; ignore "already exists" errors.
+	// Create a per-process null sink so each recorder has an isolated audio channel.
 	loadOut, loadErr := exec.Command("pactl", "load-module", "module-null-sink",
-		"sink_name=chrome_rec",
-		"sink_properties=device.description=ChromeRecorder",
+		"sink_name="+sinkName,
+		"sink_properties=device.description=ChromeRecorder_"+sinkName,
 	).Output()
 	if loadErr != nil {
-		log.Printf("pactl load-module: %v — sink may already exist, continuing", loadErr)
-	} else {
-		log.Printf("PulseAudio null sink loaded (module %s)", strings.TrimSpace(string(loadOut)))
+		return "", "", fmt.Errorf("pactl load-module: %w", loadErr)
 	}
+	moduleID = strings.TrimSpace(string(loadOut))
+	log.Printf("PulseAudio null sink loaded (module %s, sink %s)", moduleID, sinkName)
+	return sinkName + ".monitor", moduleID, nil
+}
 
-	return "chrome_rec.monitor", nil
+// teardownLinuxAudio unloads the PulseAudio module created by setupLinuxAudio.
+func teardownLinuxAudio(moduleID string) {
+	if moduleID == "" {
+		return
+	}
+	if err := exec.Command("pactl", "unload-module", moduleID).Run(); err != nil {
+		log.Printf("pactl unload-module %s: %v", moduleID, err)
+	} else {
+		log.Printf("PulseAudio null sink unloaded (module %s)", moduleID)
+	}
 }
 
 // ensureDisplay makes sure a valid DISPLAY is available on Linux.
@@ -1278,6 +1301,43 @@ func stopRecorder(page *rod.Page) ([]byte, string, error) {
 }
 
 // dismissNotifications closes any visible dismissible alert/notification banners
+// isLoginPageVisible returns true when Adobe Connect is showing its login form
+// instead of the recording player — which happens when the session URL has
+// expired or the session token is no longer valid.
+//
+// IMPORTANT: .main-login-form and #loginSection are also present in the normal
+// (valid-link) page but are hidden inside display:none containers and contain
+// no actual login inputs. The expired-session page is uniquely identified by
+// the presence of the real authentication inputs (username text field and
+// password field) which do NOT exist anywhere in the normal page DOM.
+func isLoginPageVisible(page *rod.Page) (bool, error) {
+	res, err := page.Eval(`() => {
+		// These inputs exist ONLY on the real login/expired-session page.
+		// The normal recording page never has these elements in the DOM.
+		const authSelectors = [
+			'input[name="login"]',      // username text field
+			'input[name="password"]',   // password field
+		];
+		// At least one must be present (and not hidden inside a display:none wrapper).
+		return authSelectors.some(sel => {
+			const el = document.querySelector(sel);
+			if (!el) return false;
+			// Walk up the tree: if any ancestor is display:none the form is not shown.
+			let node = el;
+			while (node && node !== document.body) {
+				if (window.getComputedStyle(node).display === 'none') return false;
+				node = node.parentElement;
+			}
+			return true;
+		});
+	}`)
+	if err != nil {
+		return false, err
+	}
+	return res.Value.Bool(), nil
+}
+
+// dismissNotifications closes any dismissible overlay banners on the recording page
 // (e.g. the "Switch to Classic View" banner in Adobe Connect).
 // Returns the number of Close buttons clicked.
 func dismissNotifications(page *rod.Page) (int, error) {

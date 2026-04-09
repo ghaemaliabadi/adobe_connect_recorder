@@ -468,6 +468,22 @@ func (m *Manager) runJob(job *Job) {
 				}
 			}
 
+			// Detect expired session marker emitted by the recorder.
+			if strings.Contains(line, "[SESSION_EXPIRED]") {
+				mgr.mu.Lock()
+				job.ErrorMsg = "سشن منقضی شده — لینک جدیدی از Adobe Connect دریافت کنید"
+				mgr.mu.Unlock()
+				// Broadcast a dedicated alert so the frontend can show a prominent banner.
+				if alertEvt, err := json.Marshal(map[string]string{
+					"id":      job.ID,
+					"type":    "session_expired",
+					"course":  job.CourseName,
+					"session": job.Session,
+				}); err == nil {
+					mgr.hub.broadcast("alert", string(alertEvt))
+				}
+			}
+
 			logEvent, _ := json.Marshal(map[string]string{"id": job.ID, "line": line})
 			mgr.hub.broadcast("log", string(logEvent))
 		}
@@ -1209,8 +1225,8 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .search-bar input{flex:1;padding:8px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem;font-family:inherit;outline:none;direction:rtl}
 .search-bar input:focus{border-color:var(--accent)}
 .search-bar .file-count{font-size:.78rem;color:var(--text3);white-space:nowrap}
-.files-table td.td-name{font-family:monospace;font-size:.8rem;direction:ltr;text-align:left;color:var(--accent)}
-.files-table td.td-size{white-space:nowrap;color:var(--text2);font-size:.78rem;text-align:center}
+.files-table td.td-name{font-family:monospace;font-size:.8rem;text-align:right;color:var(--accent)}
+.files-table td.td-size{white-space:nowrap;color:var(--text2);font-size:.78rem;text-align:right}
 .files-table th{text-align:right}
 .files-table .td-course{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .files-table .td-session{color:var(--text2);font-size:.78rem;white-space:nowrap}
@@ -1310,18 +1326,6 @@ tr:hover td{background:rgba(255,255,255,.02)}
   <div class="history-section">
     <h2>ضبط‌های اخیر</h2>
     <div class="card" style="padding:0">
-
-      <!-- Unified search: filters both history table and file browser simultaneously -->
-      <div class="global-search-wrap">
-        <span class="global-search-icon">🔍</span>
-        <input type="text" id="globalSearch"
-               placeholder="جستجو در نام درس یا جلسه… (در هر دو بخش)"
-               oninput="onGlobalSearch(this.value)"
-               autocomplete="off">
-        <button class="global-search-clear" id="searchClear" onclick="clearSearch()" title="پاک‌کردن">✕</button>
-        <span class="global-search-badge" id="searchBadge" style="display:none"></span>
-      </div>
-
       <div class="table-wrap">
         <table id="histTable">
           <thead>
@@ -1410,6 +1414,20 @@ function connectSSE() {
       if (m) { job.elapsed = m[1]; job.total = m[2]; }
       appendLogLine(id, line);
       updateProgress(job);
+    }
+  });
+
+  evtSource.addEventListener('alert', e => {
+    const data = JSON.parse(e.data);
+    if (data.type === 'session_expired') {
+      const label = [data.course, data.session].filter(Boolean).join(' — ') || data.id;
+      toast(
+        '⚠️ <strong>سشن منقضی شده</strong><br>' +
+        (label ? '<small>' + label + '</small><br>' : '') +
+        'لینک ارسال‌شده قدیمی است. لطفاً از Adobe Connect یک لینک جلسه جدید دریافت کنید.',
+        'warn',
+        0   // sticky — user must dismiss manually
+      );
     }
   });
 
@@ -1567,15 +1585,10 @@ function appendLogLine(id, line) {
 }
 
 function renderHistory() {
-  const q = getSearchQuery();
-  const done = jobs.filter(j =>
-    (j.status === 'done' || j.status === 'failed') && matchesQuery(j.course_name, j.session, q)
-  );
+  const done = jobs.filter(j => j.status === 'done' || j.status === 'failed');
   const tbody = document.getElementById('histBody');
   if (done.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="no-history">' +
-      (q ? 'نتیجه‌ای برای «' + escHtml(q) + '» یافت نشد.' : 'هنوز ضبطی انجام نشده.') +
-      '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="no-history">هنوز ضبطی انجام نشده.</td></tr>';
     return;
   }
   tbody.innerHTML = done.map(job => {
@@ -1586,11 +1599,9 @@ function renderHistory() {
       : (job.error ? '<span style="color:var(--red);font-size:.75rem">' + escHtml(job.error) + '</span>' : '—');
     const statusBadge = '<span class="job-badge badge-' + job.status + '">' + badgeLabel(job.status) + '</span>';
     const duration = (job.elapsed && job.total) ? job.elapsed + ' / ' + job.total : (job.total || '—');
-    const courseHTML = q ? highlight(job.course_name, q) : escHtml(job.course_name);
-    const sessionHTML = q ? highlight(job.session||'—', q) : escHtml(job.session||'—');
-    return '<tr><td>' + testBadge + courseHTML + '</td><td>' + sessionHTML +
+    return '<tr><td>' + testBadge + escHtml(job.course_name) + '</td><td>' + escHtml(job.session||'—') +
       '</td><td>' + statusBadge + '</td><td class="td-date">' + fmtDate(job.finished_at||job.created_at) +
-      '</td><td style="font-family:monospace;font-size:.8rem;direction:ltr;text-align:left">' + duration +
+      '</td><td style="font-family:monospace;font-size:.8rem;text-align:right">' + duration +
       '</td><td>' + dlCell + '</td></tr>';
   }).join('');
 }
@@ -1673,16 +1684,8 @@ function escHtml(s) {
 }
 function escAttr(s) { return escHtml(s); }
 
-// ─── Global search ────────────────────────────────────────────────────────────
-function getSearchQuery() {
-  return (document.getElementById('globalSearch')?.value || '').trim().toLowerCase();
-}
-
-function matchesQuery(courseName, session, q) {
-  if (!q) return true;
-  return (courseName||'').toLowerCase().includes(q) ||
-         (session||'').toLowerCase().includes(q);
-}
+// ─── File browser ─────────────────────────────────────────────────────────────
+let allFiles = [];
 
 // Wrap matching text in a highlight span.
 function highlight(text, q) {
@@ -1692,42 +1695,8 @@ function highlight(text, q) {
   if (idx < 0) return s;
   return s.slice(0, idx) +
     '<mark style="background:rgba(88,166,255,.3);color:var(--text);border-radius:2px;padding:0 1px">' +
-    s.slice(idx, idx + q.length) +
-    '</mark>' +
-    s.slice(idx + q.length);
+    s.slice(idx, idx + q.length) + '</mark>' + s.slice(idx + q.length);
 }
-
-function onGlobalSearch(val) {
-  const q = val.trim().toLowerCase();
-  const clearBtn = document.getElementById('searchClear');
-  const badge = document.getElementById('searchBadge');
-  if (clearBtn) clearBtn.classList.toggle('visible', q.length > 0);
-  renderHistory();
-  // Sync file browser search input with global query
-  const fs = document.getElementById('fileSearch');
-  if (fs) { fs.value = val; filterFiles(); }
-  // Update badge with result count
-  if (badge) {
-    const histCount = jobs.filter(j =>
-      (j.status === 'done' || j.status === 'failed') && matchesQuery(j.course_name, j.session, q)
-    ).length;
-    if (q) {
-      badge.textContent = histCount + ' نتیجه';
-      badge.style.display = '';
-    } else {
-      badge.style.display = 'none';
-    }
-  }
-}
-
-function clearSearch() {
-  const el = document.getElementById('globalSearch');
-  if (el) { el.value = ''; el.focus(); }
-  onGlobalSearch('');
-}
-
-// ─── File browser ─────────────────────────────────────────────────────────────
-let allFiles = [];
 
 async function loadFiles() {
   document.getElementById('fileCount').textContent = '…';
@@ -1742,10 +1711,7 @@ async function loadFiles() {
 }
 
 function filterFiles() {
-  // Use global search query first; fall back to the file-specific input.
-  const globalQ = getSearchQuery();
-  const localQ  = (document.getElementById('fileSearch')?.value || '').trim().toLowerCase();
-  const q = globalQ || localQ;
+  const q = (document.getElementById('fileSearch')?.value || '').trim().toLowerCase();
 
   const filtered = q
     ? allFiles.filter(f =>
